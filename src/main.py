@@ -451,7 +451,6 @@ async def generate_streaming_response(
             max_turns=claude_options.get("max_turns", 10),
             allowed_tools=claude_options.get("allowed_tools"),
             disallowed_tools=claude_options.get("disallowed_tools"),
-            permission_mode=claude_options.get("permission_mode"),
             stream=True,
         ):
             chunks_buffer.append(chunk)
@@ -710,7 +709,6 @@ async def chat_completions(
                 max_turns=claude_options.get("max_turns", 10),
                 allowed_tools=claude_options.get("allowed_tools"),
                 disallowed_tools=claude_options.get("disallowed_tools"),
-                permission_mode=claude_options.get("permission_mode"),
                 stream=False,
             ):
                 chunks.append(chunk)
@@ -818,7 +816,6 @@ async def anthropic_messages(
             model=request_body.model,
             max_turns=10,
             allowed_tools=DEFAULT_ALLOWED_TOOLS,
-            permission_mode="bypassPermissions",
             stream=False,
         ):
             chunks.append(chunk)
@@ -1829,9 +1826,12 @@ async def register_mcp_server(
 
     config = MCPServerConfig(
         name=body.name,
-        command=body.command,
+        transport=body.transport,
+        command=body.command or "",
         args=body.args,
         env=body.env,
+        url=body.url or "",
+        headers=body.headers,
         description=body.description,
         enabled=body.enabled,
     )

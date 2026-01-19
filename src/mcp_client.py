@@ -5,6 +5,7 @@ Provides functionality to discover, connect to, and interact with MCP servers
 that expose tools, resources, and prompts.
 """
 
+import asyncio
 import logging
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from threading import Lock
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
+    from mcp.client.sse import sse_client
 
     MCP_AVAILABLE = True
 except ImportError:
@@ -21,6 +23,7 @@ except ImportError:
     ClientSession = None
     StdioServerParameters = None
     stdio_client = None
+    sse_client = None
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +33,15 @@ class MCPServerConfig:
     """Configuration for an MCP server."""
 
     name: str
-    command: str
+    transport: str = "stdio"  # "stdio" or "sse"
+    # Stdio transport fields
+    command: str = ""
     args: List[str] = field(default_factory=list)
     env: Optional[Dict[str, str]] = None
+    # SSE transport fields
+    url: str = ""
+    headers: Optional[Dict[str, str]] = None
+    # Common fields
     description: str = ""
     enabled: bool = True
 
@@ -45,6 +54,8 @@ class MCPServerConnection:
     session: Any  # ClientSession
     read_stream: Any
     write_stream: Any
+    transport_cm: Any = None  # Transport context manager (stdio/sse)
+    session_cm: Any = None  # Session context manager
     connected_at: datetime = field(default_factory=datetime.utcnow)
     available_tools: List[Dict[str, Any]] = field(default_factory=list)
     available_resources: List[Dict[str, Any]] = field(default_factory=list)
@@ -118,70 +129,98 @@ class MCPClient:
             return True
 
         try:
-            # Create server parameters
-            server_params = StdioServerParameters(
-                command=config.command,
-                args=config.args,
-                env=config.env,
-            )
+            # Connect based on transport type
+            transport_cm = None  # Transport context manager for cleanup
+            session_cm = None  # Session context manager for cleanup
+            if config.transport == "sse":
+                # SSE/HTTP transport for remote MCP servers (e.g., n8n)
+                transport_cm = sse_client(config.url, headers=config.headers)
+                read, write = await transport_cm.__aenter__()
+            else:
+                # Stdio transport for local MCP servers
+                server_params = StdioServerParameters(
+                    command=config.command,
+                    args=config.args,
+                    env=config.env,
+                )
+                transport_cm = stdio_client(server_params)
+                read, write = await transport_cm.__aenter__()
 
-            # Connect to server
-            read, write = await stdio_client(server_params)
-            session = ClientSession(read, write)
+            # ClientSession is also an async context manager - must enter it to start message loop
+            session_cm = ClientSession(read, write)
+            session = await session_cm.__aenter__()
 
-            # Initialize session
-            await session.initialize()
+            # Initialize session and get server capabilities
+            init_result = await session.initialize()
+            server_caps = {}
+            if init_result and hasattr(init_result, "capabilities"):
+                server_caps = init_result.capabilities or {}
+            logger.debug(f"Server '{name}' capabilities: {server_caps}")
 
-            # List available capabilities
+            # List available capabilities (only if server supports them)
             available_tools = []
             available_resources = []
             available_prompts = []
 
-            try:
-                # List tools
-                tools_response = await session.list_tools()
-                if tools_response and hasattr(tools_response, "tools"):
-                    available_tools = [
-                        {
-                            "name": tool.name,
-                            "description": getattr(tool, "description", ""),
-                            "input_schema": getattr(tool, "inputSchema", {}),
-                        }
-                        for tool in tools_response.tools
-                    ]
-            except Exception as e:
-                logger.warning(f"Could not list tools from {name}: {e}")
+            # Check if server has tools capability
+            has_tools = hasattr(server_caps, "tools") and server_caps.tools is not None
+            has_resources = hasattr(server_caps, "resources") and server_caps.resources is not None
+            has_prompts = hasattr(server_caps, "prompts") and server_caps.prompts is not None
 
-            try:
-                # List resources
-                resources_response = await session.list_resources()
-                if resources_response and hasattr(resources_response, "resources"):
-                    available_resources = [
-                        {
-                            "uri": resource.uri,
-                            "name": getattr(resource, "name", ""),
-                            "description": getattr(resource, "description", ""),
-                            "mimeType": getattr(resource, "mimeType", None),
-                        }
-                        for resource in resources_response.resources
-                    ]
-            except Exception as e:
-                logger.warning(f"Could not list resources from {name}: {e}")
+            if has_tools:
+                try:
+                    # List tools with timeout
+                    tools_response = await asyncio.wait_for(session.list_tools(), timeout=10.0)
+                    if tools_response and hasattr(tools_response, "tools"):
+                        available_tools = [
+                            {
+                                "name": tool.name,
+                                "description": getattr(tool, "description", ""),
+                                "input_schema": getattr(tool, "inputSchema", {}),
+                            }
+                            for tool in tools_response.tools
+                        ]
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout listing tools from {name}")
+                except Exception as e:
+                    logger.warning(f"Could not list tools from {name}: {e}")
 
-            try:
-                # List prompts
-                prompts_response = await session.list_prompts()
-                if prompts_response and hasattr(prompts_response, "prompts"):
-                    available_prompts = [
-                        {
-                            "name": prompt.name,
-                            "description": getattr(prompt, "description", ""),
-                            "arguments": getattr(prompt, "arguments", []),
-                        }
-                        for prompt in prompts_response.prompts
-                    ]
-            except Exception as e:
-                logger.warning(f"Could not list prompts from {name}: {e}")
+            if has_resources:
+                try:
+                    # List resources with timeout
+                    resources_response = await asyncio.wait_for(session.list_resources(), timeout=10.0)
+                    if resources_response and hasattr(resources_response, "resources"):
+                        available_resources = [
+                            {
+                                "uri": resource.uri,
+                                "name": getattr(resource, "name", ""),
+                                "description": getattr(resource, "description", ""),
+                                "mimeType": getattr(resource, "mimeType", None),
+                            }
+                            for resource in resources_response.resources
+                        ]
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout listing resources from {name}")
+                except Exception as e:
+                    logger.warning(f"Could not list resources from {name}: {e}")
+
+            if has_prompts:
+                try:
+                    # List prompts with timeout
+                    prompts_response = await asyncio.wait_for(session.list_prompts(), timeout=10.0)
+                    if prompts_response and hasattr(prompts_response, "prompts"):
+                        available_prompts = [
+                            {
+                                "name": prompt.name,
+                                "description": getattr(prompt, "description", ""),
+                                "arguments": getattr(prompt, "arguments", []),
+                            }
+                            for prompt in prompts_response.prompts
+                        ]
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout listing prompts from {name}")
+                except Exception as e:
+                    logger.warning(f"Could not list prompts from {name}: {e}")
 
             # Store connection
             connection = MCPServerConnection(
@@ -189,6 +228,8 @@ class MCPClient:
                 session=session,
                 read_stream=read,
                 write_stream=write,
+                transport_cm=transport_cm,
+                session_cm=session_cm,
                 available_tools=available_tools,
                 available_resources=available_resources,
                 available_prompts=available_prompts,
@@ -236,8 +277,11 @@ class MCPClient:
             del self.connections[name]
 
         try:
-            # Close the session gracefully
-            # The MCP SDK handles cleanup when session is garbage collected
+            # Close context managers in reverse order (session first, then transport)
+            if connection.session_cm:
+                await connection.session_cm.__aexit__(None, None, None)
+            if connection.transport_cm:
+                await connection.transport_cm.__aexit__(None, None, None)
             logger.info(f"Disconnected from MCP server: {name}")
             return True
         except Exception as e:

@@ -6,6 +6,8 @@ services:
       - "9100:8000"
     networks:
       - n8n_default
+      - pt-marking-system_pt-marking-network
+    container_name: claude-wrapper
     restart: unless-stopped
 
     volumes:
@@ -24,4 +26,7 @@ services:
 networks:
   n8n_default:
     name: n8n_default
+    external: true
+  pt-marking-system_pt-marking-network:
+    name: pt-marking-system_pt-marking-network
     external: true

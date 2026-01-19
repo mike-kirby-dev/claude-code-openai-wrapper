@@ -314,9 +314,15 @@ class MCPServerConfigRequest(BaseModel):
     """Request model for registering an MCP server."""
 
     name: str
-    command: str
+    transport: Literal["stdio", "sse"] = "stdio"
+    # Stdio transport fields
+    command: Optional[str] = None
     args: List[str] = Field(default_factory=list)
     env: Optional[Dict[str, str]] = None
+    # SSE transport fields
+    url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    # Common fields
     description: str = ""
     enabled: bool = True
 
@@ -335,15 +341,20 @@ class MCPServerConfigRequest(BaseModel):
             )
         return v.strip()
 
-    @field_validator("command")
-    @classmethod
-    def validate_command(cls, v: str) -> str:
-        """Validate MCP server command."""
-        if not v or not v.strip():
-            raise ValueError("Command cannot be empty")
-        if len(v) > 500:
-            raise ValueError("Command path too long (max 500 characters)")
-        return v.strip()
+    @model_validator(mode="after")
+    def validate_transport_fields(self) -> "MCPServerConfigRequest":
+        """Validate that required fields are present based on transport type."""
+        if self.transport == "stdio":
+            if not self.command or not self.command.strip():
+                raise ValueError("Command is required for stdio transport")
+            if len(self.command) > 500:
+                raise ValueError("Command path too long (max 500 characters)")
+            self.command = self.command.strip()
+        elif self.transport == "sse":
+            if not self.url or not self.url.strip():
+                raise ValueError("URL is required for sse transport")
+            self.url = self.url.strip()
+        return self
 
 
 class MCPServerInfoResponse(BaseModel):

@@ -8,6 +8,7 @@ import logging
 from types import SimpleNamespace
 
 from claude_agent_sdk import query, ClaudeAgentOptions
+from src.mcp_client import mcp_client
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,38 @@ class ClaudeCodeCLI:
             logger.warning("  3. Test: claude --print 'Hello'")
             return False
 
+    def _get_mcp_servers_config(self) -> Dict[str, Any]:
+        """Get connected MCP servers in Claude Agent SDK format."""
+        mcp_servers = {}
+
+        # Get all connected servers from the MCP client
+        for server_name in mcp_client.list_connected_servers():
+            connection = mcp_client.get_connection(server_name)
+            if connection and connection.config:
+                config = connection.config
+                if config.transport == "sse":
+                    # SSE/HTTP transport
+                    server_config = {
+                        "type": "sse",
+                        "url": config.url,
+                    }
+                    if config.headers:
+                        server_config["headers"] = config.headers
+                else:
+                    # Stdio transport
+                    server_config = {
+                        "type": "stdio",
+                        "command": config.command,
+                        "args": config.args,
+                    }
+                    if config.env:
+                        server_config["env"] = config.env
+
+                mcp_servers[server_name] = server_config
+                logger.debug(f"Added MCP server '{server_name}' to SDK config: {server_config}")
+
+        return mcp_servers
+
     async def run_completion(
         self,
         prompt: str,
@@ -137,13 +170,31 @@ class ClaudeCodeCLI:
 
                 logger.debug(f"Initial Claude Agent SDK options: {options}")
 
+                # Add connected MCP servers to options and allow their tools
+                mcp_servers_config = self._get_mcp_servers_config()
+                mcp_tools = []
+                if mcp_servers_config:
+                    options.mcp_servers = mcp_servers_config
+                    # Get actual tool names from connected MCP servers
+                    for server_name in mcp_servers_config.keys():
+                        connection = mcp_client.get_connection(server_name)
+                        if connection and connection.available_tools:
+                            for tool in connection.available_tools:
+                                tool_name = f"mcp__{server_name}__{tool['name']}"
+                                mcp_tools.append(tool_name)
+                    logger.info(f"Added {len(mcp_servers_config)} MCP server(s) to options: {list(mcp_servers_config.keys())}")
+                    if mcp_tools:
+                        logger.info(f"Auto-allowing MCP tools: {mcp_tools}")
+
                 # Set model if specified
                 if model:
                     options.model = model
 
-                # Set tool restrictions
-                if allowed_tools:
-                    options.allowed_tools = allowed_tools
+                # Set tool restrictions - include MCP tools
+                combined_allowed_tools = list(allowed_tools) if allowed_tools else []
+                combined_allowed_tools.extend(mcp_tools)
+                if combined_allowed_tools:
+                    options.allowed_tools = combined_allowed_tools
                 if disallowed_tools:
                     options.disallowed_tools = disallowed_tools
 
